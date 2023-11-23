@@ -19,7 +19,7 @@ dtr = DieterModel(datapath);
 
 # Settings tuple
 settings = (year_set = ["1996d1","1996d2","1996d3","1996d4"],
-            lds_mode = true,
+            lds_mode = false,
             init_lds_lvl = 0.5,
             year_prob = fill(1/4,4),
             maxhours = 24,
@@ -103,7 +103,7 @@ end
 @everywhere include("benders_functions.jl")
 
 # function to run sub-problems
-function run_all_subproblems(year_set::Vector,res_obj,opt_tol,solver)
+function run_all_subproblems(year_set::Vector,res_obj,opt_tol)
     solvedFut_dict = Dict{Int,Future}()
     for j in eachindex(year_set)
         solvedFut_dict[j] = @spawnat j+1 run_sub_distributed(res_obj,opt_tol)
@@ -191,8 +191,7 @@ end
 sub_dtr = deepcopy(dtr)
 year_set = settings.year_set
 capa_vars = string.(mstr[:capa])
-lds_lvl_vars = string.(mstr[:lds_lvl])
-passobj(1,workers(),[:sub_dtr,:year_set,:solver,:datapath,:ts_path,:settings,:capa_vars,:lds_lvl_vars])
+passobj(1,workers(),[:sub_dtr,:year_set,:solver,:datapath,:ts_path,:settings,:capa_vars])
 
 
 
@@ -209,7 +208,7 @@ subTask_arr = map(workers()) do w
         const SUB_M = buildSub(myid()-1)
 
         function run_sub_distributed(res_data,opt_tol)
-            tmp_oracle = solve_seq_subproblem(SUB_M,res_data,opt_tol,capa_vars,lds_lvl_vars;solver=solver)
+            tmp_oracle = solve_subproblem(SUB_M,res_data,opt_tol,capa_vars;solver=solver)
             return tmp_oracle
         end
 
@@ -318,7 +317,7 @@ for k in 1:settings.parameters.max_iter
         lower_bound_stabilised = objective_value(qm)
         # make sure that there are no numerical infeasibilities in candidate solution
         capa_res = settings.lds_mode ? distance_minimizer(mstr,value.(qm[:compl]),settings.solver) : distance_minimizer(mstr,value.(qm[:capa]),settings.solver)
-        lds_lvl = settings.lds_mode ? Dict(qm[:lds_lvl] .=>value.(qm[:lds_lvl])) : nothing
+        #lds_lvl = settings.lds_mode ? Dict(qm[:lds_lvl] .=>value.(qm[:lds_lvl])) : nothing
         # compute lower bound based on unstabilised problem
         #if settings.parameters.stab_method != :lvl
             optimize!(mstr)
@@ -331,13 +330,162 @@ for k in 1:settings.parameters.max_iter
         capa_res = settings.lds_mode ? distance_minimizer(mstr,value.(qm[:compl]),settings.solver) : distance_minimizer(mstr,value.(qm[:capa]),settings.solver)
     end
 
-    # Step 2 Pass on candidate iterate to sub-problems
-    for k in keys(lds_lvl)
-        if occursin(string(year)*"_",string(k))
-            @constraint()
-        elseif occursin("_"*string(year),string(k))
-            println("start")
-        else
+    # Run subproblems on workers
+    solved_dict = run_all_subproblems(settings.year_set,capa_res,compute_conv_tol(gap,settings.parameters.optimality_gap,settings.parameters.acc_tup))
+    oracle_output = get_sub_results!(k,oracle_output,settings.year_set,solved_dict)
 
+        if settings.dual_num_control_bool
+            for year in settings.year_set
+                oracle_output[k][year].duals[oracle_output[k][year].duals[abs.(oracle_output[k][year].duals) .< settings.dual_num_control_eps].= zero(eltype(oracle_output[k][year].duals))] 
+            end
         end
+        
+        if settings.multicut_bool
+            if k>1
+                for s in settings.year_set push!(active_cuts,(k-1,s)) end
+                temp_duals = DenseAxisArray([dual(constraint_by_name(mstr,"cut$(j)[$s]")) for (j,s) in active_cuts],active_cuts)
+                temp_cuts = active_cuts
+                for (j,s) in active_cuts
+                    idx = findfirst(x->x==s,settings.year_set)
+                    if temp_duals[(j,s)]>0
+                        δ[j,idx] = k
+                    end
+                    if (k - δ[j,idx] > settings.parameters.cut_deletion_cutoff)&!isnothing(constraint_by_name(mstr,"cut$j[$s]"))
+                        JuMP.delete(mstr,constraint_by_name(mstr,"cut$j[$s]"))
+                        deleteat!(temp_cuts,findall(x->x==(j,s),temp_cuts)[1])
+                        @info "Deleting cut $(j)[$s]"
+                    end
+                end
+                active_cuts = temp_cuts
+            end
+        else
+            if k>1
+                push!(active_cuts,k-1)
+                temp_duals = DenseAxisArray([dual(constraint_by_name(mstr,"cut$(j)")) for j in active_cuts],active_cuts)
+                temp_cuts = active_cuts
+                for j in active_cuts
+                    if temp_duals[j] >0
+                        δ[j] = k
+                    end
+                   if ((k - δ[j]) > settings.parameters.cut_deletion_cutoff)&!isnothing(constraint_by_name(mstr,"cut$j"))
+                        JuMP.delete(mstr,constraint_by_name(mstr,"cut$j"))
+                        temp_cuts = setdiff(temp_cuts,j)
+                       @info "Deleting cut $(j)"
+                    end
+                end
+                active_cuts = temp_cuts
+            end
+        end
+    
+
+        # Update cutting plane model
+        if settings.multicut_bool
+            if !approx_bool
+                for s in settings.year_set
+                    cut = @constraint(mstr,
+                                    mstr[:θ][s] >= oracle_output[k][s].obj - mstr[:investment_obj] + sum(oracle_output[k][s].duals[i]*(mstr[:capa][i] - res[i] ) for i in eachindex(mstr[:capa]))
+                                );
+                set_name(cut,"cut$(k)[$s]")
+                end
+            end
+        else
+            if approx_bool
+                approx_idx = DenseAxisArray(approx_idx,settings.year_set)
+                cut = @constraint(mstr,
+                                mstr[:θ] >= sum(probs[s]*(oracle_output[approx_idx[s]][s].obj - mstr[:investment_obj] + oracle_output[approx_idx[s]][s].duals'*(mstr[:capa] - res)) for s in settings.year_set)
+                            );    
+            else
+                cut = @constraint(mstr,
+                                mstr[:θ] >= sum(probs[s]*(oracle_output[k][s].obj - mstr[:investment_obj] + sum(oracle_output[k][s].duals[i]*(mstr[:capa][i] - res[i] ) for i in eachindex(mstr[:capa]))) for s in settings.year_set)
+                            );
+            end
+            set_name(cut,"cut$(k)")
+        end
+
+        # compute oracle objective value and expected descent
+        v = upper_bound - lower_bound
+        if !approx_bool
+            f = sum(probs[s]*oracle_output[k][s].obj for s in settings.year_set)
+        else
+            f = upper_bound
+        end
+        #println(f)
+        #f = !approx_bool ? sum(probs[s]*oracle_output[k][s].obj for s in settings.year_set) : f
+        if settings.parameters.stab_method == :prx
+            improv = upper_bound - f
+            aux = v/improv
+            stab_params[:aux_term][k] = aux
+        end
+
+        adjCtr_bool = false
+        # serious step test
+        if upper_bound - settings.parameters.descent_threshold*v > f #&& exact_bool
+            upper_bound = f
+            x_best = res
+            push!(stability_centre,x_best)
+            #@info "Updating stability centre"
+            adjCtr_bool = true
+        end
+
+
+        # dynamic adjustment of stabilisation parameters
+        if !isnothing(settings.parameters.stab_method)
+            stab_params[:serious_step][k] = adjCtr_bool
+            incumbency_count = adjCtr_bool ? 0 : incumbency_count + 1 
+            serious_count = adjCtr_bool ? serious_count + 1 : 0
+            if settings.parameters.stab_method == :lvl || settings.parameters.stab_method == :dsb
+                stab_params[:mu][k] = 1-(dual(qm[:lvl_set])/stab_params[:scaler])
+            end
+            stab_params = dynamic_par_adjustment!(k,settings.parameters.stab_method,stab_params,upper_bound,lower_bound,lower_bound_stabilised,incumbency_count,serious_count)
+            if settings.parameters.stab_method == :qtr
+                if stab_params[:radius][k+1] - stab_params[:radius][k] > 0
+                    incumbency_count = 0
+                end
+            elseif settings.parameters.stab_method == :prx
+                if serious_count > stab_params[:step_limit]
+                    serious_count = 0
+                end
+            end
+        end
+            #return stab_params
+        # check convergence
+        gap = (upper_bound-lower_bound)/upper_bound
+        
+        # record iteration
+        star = adjCtr_bool ? "*" : ""
+        if settings.parameters.stab_method == :lvl
+            print_iteration(k,star,lower_bound,upper_bound,gap,time()-t0,stab_params[:mu][k])
+        else
+            print_iteration(k,star,lower_bound,upper_bound,gap,time()-t0)
+        end
+        push!(gap_container,gap)
+        push!(time_container,time()-t0)
+        push!(lower_container,lower_bound)
+        push!(upper_container,upper_bound)
+
+        if gap < settings.parameters.optimality_gap
+            @info "Terminating with optimal solution"
+            break
+        end
+        
+    
     end
+
+    if settings.parameters.stab_method == :qtr
+        dynPar = [stab_params[:radius][i] for i in 1:length(gap_container)]
+    elseif settings.parameters.stab_method == :prx
+        dynPar = [stab_params[:prox_param][i] for i in 1:length(gap_container)]
+    elseif settings.parameters.stab_method == :lvl 
+        dynPar = [stab_params[:v_lvl][i] for i in 1:length(gap_container)]
+    elseif settings.parameters.stab_method == :dsb
+        dynPar = [(stab_params[:v_lvl][i],stab_params[:prox_param][i]) for i in 1:length(gap_container)]
+    end
+
+    results_df = DataFrame(
+        :iteration => collect(1:length(gap_container)),
+        :lower_bound => lower_container,
+        :upper_bound => upper_container,
+        :gap => gap_container,
+        :time => time_container,
+        :dynPar => dynPar
+    )

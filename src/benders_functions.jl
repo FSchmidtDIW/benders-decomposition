@@ -28,11 +28,12 @@ end
 
 
 
-function solve_subproblem(sub_m::JuMP.AbstractModel,res,opt_gap;solver=Gurobi.Optimizer)
+function solve_subproblem(sub_m::JuMP.AbstractModel,res,opt_gap,capa_vars;solver=Gurobi.Optimizer)
     temp_mod = copy(sub_m) # copy model so as to not alter the default subproblem
     set_silent(temp_mod)
     # define complicating variables
-    capa = filter(x->contains(string.(x),"N_"),all_variables(temp_mod))
+    capa = filter(x -> (string(x) in capa_vars),all_variables(temp_mod))
+    #capa = filter(x->contains(string.(x),"N_"),all_variables(temp_mod))
     if length(capa) != length(res)
         @error "Supplied iterate vector is not of the same length as complicating variables in subproblem!"
     end
@@ -58,22 +59,22 @@ function solve_subproblem(sub_m::JuMP.AbstractModel,res,opt_gap;solver=Gurobi.Op
     return ret
 end
 
-function solve_seq_subproblem(sub_m::JuMP.AbstractModel,capa_res,lvl_res,opt_gap,capa_vars,lds_lvl_vars,year;solver=Gurobi.Optimizer)
-    temp_mod = copy(sub_m)
-    set_silent(temp_mod)
-    capa = filter(x->(string(x) in capa_vars),all_variables(temp_mod))
-    lds_lvl = filter(x->(string(x) in lds_lvl_vars),all_variables(temp_mod))
+#function solve_seq_subproblem(sub_m::JuMP.AbstractModel,capa_res,lvl_res,opt_gap,capa_vars,lds_lvl_vars,year;solver=Gurobi.Optimizer)
+#    temp_mod = copy(sub_m)
+#    set_silent(temp_mod)
+#    capa = filter(x->(string(x) in capa_vars),all_variables(temp_mod))
+#    lds_lvl = filter(x->(string(x) in lds_lvl_vars),all_variables(temp_mod))
 
     # fix capacities
-    @constraint(temp_mod,fix_capa[i=1:length(capa)],capa[i]==res[i])
+#    @constraint(temp_mod,fix_capa[i=1:length(capa)],capa[i]==res[i])
 
     # fix storage levels
     
-    @constraint(temp_mod,fix_lvl[])
+#    @constraint(temp_mod,fix_lvl[])
 
 
 
-end
+#end
 
 function solve_oda_subproblem(sub_m::JuMP.AbstractModel,res,oracle_out::Dict,target::Float64,year,opt_gap;solver=Gurobi.Optimizer)
     if !isempty(oracle_out)
@@ -352,7 +353,23 @@ function benders(dtr::DieterModel,
     set_attribute(mstr,"OutputFlag",0);
     # create container with complicating variables
     mstr[:capa] = all_variables(mstr)
+    if settings.lds_mode && DIETER.cond_ext(:h2,"all",mastr_dtr)
+        # Run test if H2 module is active for at least one node
+        # Define set of year steps
+        step_set = [settings.year_set[s]*"_"*settings.year_set[s+1] for s in collect(1:(length(settings.year_set)-1))]
+        # Add variables for all LDS technologies and all nodes and all steps
+        @variable(mstr,LDSlev[n=mastr_dtr.sets[:n],s=mastr_dtr.sets[:stoh2],step=step_set; DIETER.cond_ext(:h2,n,mastr_dtr) && DIETER.cond_h2(s,n,mastr_dtr) && mastr_dtr.parameters[:h2_max_energy_sto][n,s] != 0] >= 0);
+        # Add valid inequality to ensure consistency of capa and storage levels
+        @constraint(mstr,LDSVI[n=mastr_dtr.sets[:n],s=mastr_dtr.sets[:stoh2],step=step_set; DIETER.cond_ext(:h2,n,mastr_dtr) && DIETER.cond_h2(s,n,mastr_dtr) && mastr_dtr.parameters[:h2_max_energy_sto][n,s] != 0],
+            LDSlev[n,s,step] <= mstr[:H2_N_STO_E][n,s]
+        );
+    
+    
+    mstr[:compl] = all_variables(mstr)
+    mstr[:lds_lvl] = setdiff(mstr[:compl],mstr[:capa])
+    end
     mstr[:investment_obj] = objective_function(mstr)
+
 
     # add value function model
     if settings.multicut_bool
@@ -377,7 +394,7 @@ function benders(dtr::DieterModel,
             sub_dtr_dict[y] = create_sub_dict(deepcopy(sub_dtr),y)
             tmp = copy(sub_m)
             define_model!(tmp,sub_dtr_dict[y],maxhours=settings.maxhours)
-            tmp[:capa] = filter(x->contains(string.(x),"N_"),all_variables(tmp))
+            tmp[:capa] = filter(x->(string(x) in string.(keys(capas_dict))),all_variables(tmp))
             @constraint(tmp,fix[i=eachindex(tmp[:capa])],tmp[:capa][i]==1)
             d_tmp = dualize(tmp,dual_names=DualNames("dual_",""))
             sub_mod_dict[y] = d_tmp
@@ -415,7 +432,7 @@ function benders(dtr::DieterModel,
         init_mod = Model(solver)
         define_model!(init_mod,sub_dtr_dict[settings.presolve_year],maxhours=settings.presolve_hours)
         optimize!(init_mod)
-        x0 = value.(filter(x->contains(string.(x),"N_"),all_variables(init_mod)))
+        x0 = value.(filter(x->(string(x) in string.(mstr[:compl])),all_variables(init_mod)))
         @assert length(x0) == length(mstr[:capa])
     else
         x0 = zeros(length(mstr[:capa]))
@@ -753,4 +770,8 @@ function create_sub_models(year::Int,sub_dtr_dict::Dict,maxhours)
     tp = JuMP.Model(Gurobi.Optimizer)
     define_model!(tp,tmp_dtr,maxhours=maxhours)
    return tp
+end
+
+function map_storage_compl(year_set::Vector{Int},top_m::JuMP.AbstractModel,sub_m::JuMP.AbstractModel)
+    lds_lvl = top_m[:lds_lvl]
 end
